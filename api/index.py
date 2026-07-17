@@ -466,6 +466,7 @@ def generate_payment_link(chat_id, user_id, exam_type: str, quantity: int):
         "email": email,
         "amount": int(total * 100),  # Paystack uses smallest currency unit
         "currency": "GHS",
+        "callback_url": f"https://t.me/{BOT_USERNAME}",
         "metadata": {
             "custom_fields": [
                 {"display_name": "Exam Type", "variable_name": "exam_type", "value": exam_type},
@@ -499,8 +500,10 @@ def generate_payment_link(chat_id, user_id, exam_type: str, quantity: int):
                 chat_id,
                 (
                     f"✅ *Payment link ready!*\n\n"
-                    f"💾 *Save your reference:*\n`{ref}`\n\n"
-                    f"After paying, verify with:\n`/verify_payment {ref}`"
+                    f"🎁 *Automatic Delivery:*\n"
+                    f"Your codes will be sent here automatically as soon as payment is completed.\n\n"
+                    f"💾 *Transaction Reference (for backup):*\n`{ref}`\n\n"
+                    f"_If codes don't arrive immediately, you can verify manually with:_\n`/verify_payment {ref}`"
                 ),
                 reply_markup=keyboard,
             )
@@ -661,6 +664,34 @@ def handle_state_input(chat_id, user_id, text: str, session: dict):
             msg += f"\n⚠️ *{skipped}* line(s) skipped (wrong format — must be `PIN SERIAL`)."
         send_message(chat_id, msg)
 
+    # ── Delete checker codes ───────────────────────────────────────────────
+    elif state and state.startswith("awaiting_delete_"):
+        if user_id not in ADMINS:
+            clear_state(user_id)
+            return
+        exam_type = state.replace("awaiting_delete_", "")
+        code_id_str = text.strip()
+        if not code_id_str.isdigit():
+            send_message(chat_id, "❌ Invalid ID. Please send a numeric ID:")
+            return
+        
+        code_id = int(code_id_str)
+        # Check if code exists, is unused and matches the exam type
+        exists = db_exec(
+            "SELECT id, serial_number FROM checker_codes WHERE id = %s AND exam_type = %s AND is_used = FALSE",
+            (code_id, exam_type),
+            fetch="one"
+        )
+        if not exists:
+            send_message(chat_id, f"❌ No unused *{exam_type}* code found with ID `{code_id}`. Please send another ID:")
+            return
+        
+        # Delete code
+        db_exec("DELETE FROM checker_codes WHERE id = %s", (code_id,))
+        clear_state(user_id)
+        send_message(chat_id, f"✅ Successfully deleted {exam_type} code (ID: `{code_id}`, SN: `{exists['serial_number']}`).")
+        show_main_menu(chat_id, user_id)
+
     else:
         # Unknown state — reset
         clear_state(user_id)
@@ -719,14 +750,64 @@ def handle_callback(update: dict):
 
     # ── View codes (admin) ─────────────────────────────────────────────────
     elif data.startswith("viewcodes_"):
+        if user_id not in ADMINS:
+            send_message(chat_id, "❌ Unauthorized.")
+            return
         exam_type = data.split("_")[1]
+        
+        # Get count
         row = db_exec(
             "SELECT COUNT(*) AS cnt FROM checker_codes WHERE exam_type = %s AND is_used = FALSE",
             (exam_type,),
             fetch="one",
         )
         cnt = row["cnt"] if row else 0
-        send_message(chat_id, f"📄 *{exam_type}* — *{cnt}* code(s) available.")
+        
+        # Get codes
+        codes = db_exec(
+            "SELECT id, pin, serial_number FROM checker_codes WHERE exam_type = %s AND is_used = FALSE ORDER BY id ASC LIMIT 30",
+            (exam_type,),
+            fetch="all",
+        )
+        
+        msg = f"📄 *{exam_type} Checker Codes* ({cnt} total available):\n\n"
+        if not codes:
+            msg += "_No unused codes available in the database._"
+            keyboard = inline_kb([
+                [ibtn("⬅️ Back to Types", callback_data="view_codes_menu")]
+            ])
+        else:
+            msg += "*Showing first 30 unused codes:*\n"
+            for c in codes:
+                msg += f"• *ID:* `{c['id']}` | Pin: `{c['pin']}` | Serial: `{c['serial_number']}`\n"
+            
+            msg += "\nTo delete a code, click below or send `/delete_code ID`."
+            
+            keyboard = inline_kb([
+                [ibtn("❌ Delete Code by ID", callback_data=f"ask_delete_{exam_type}")],
+                [ibtn("⬅️ Back to Types", callback_data="view_codes_menu")]
+            ])
+            
+        edit_message(chat_id, message_id, msg, reply_markup=keyboard)
+
+    elif data == "view_codes_menu":
+        if user_id not in ADMINS:
+            send_message(chat_id, "❌ Unauthorized.")
+            return
+        edit_message(chat_id, message_id, "📄 Select exam type to view available codes:", reply_markup=inline_kb([
+            [ibtn("BECE",   callback_data="viewcodes_BECE")],
+            [ibtn("WASSCE", callback_data="viewcodes_WASSCE")],
+            [ibtn("NOVDEC", callback_data="viewcodes_NOVDEC")],
+            [ibtn("⬅️ Back", callback_data="back_to_menu")],
+        ]))
+
+    elif data.startswith("ask_delete_"):
+        if user_id not in ADMINS:
+            send_message(chat_id, "❌ Unauthorized.")
+            return
+        exam_type = data.split("_")[2]
+        set_state(user_id, f"awaiting_delete_{exam_type}")
+        send_message(chat_id, f"❌ Send the database *ID* of the {exam_type} code you want to delete:")
 
     # ── Task verification ──────────────────────────────────────────────────
     elif data.startswith("verify_task_"):
@@ -815,6 +896,31 @@ def handle_message(update: dict):
             verify_payment(chat_id, user_id, parts[1].strip())
         else:
             send_message(chat_id, "❌ Usage: `/verify_payment YOUR_REFERENCE`")
+        return
+
+    if text.startswith("/delete_code"):
+        if user_id not in ADMINS:
+            send_message(chat_id, "❌ Unauthorized.")
+            return
+        parts = text.split(" ")
+        if len(parts) > 1 and parts[1].strip().isdigit():
+            code_id = int(parts[1].strip())
+            c = db_exec(
+                "SELECT exam_type, serial_number, is_used FROM checker_codes WHERE id = %s",
+                (code_id,),
+                fetch="one"
+            )
+            if not c:
+                send_message(chat_id, f"❌ Code with ID `{code_id}` not found.")
+                return
+            if c["is_used"]:
+                send_message(chat_id, f"⚠️ Code with ID `{code_id}` ({c['exam_type']} - SN: `{c['serial_number']}`) has already been used and cannot be deleted.")
+                return
+            
+            db_exec("DELETE FROM checker_codes WHERE id = %s", (code_id,))
+            send_message(chat_id, f"✅ Successfully deleted *{c['exam_type']}* checker code (ID: `{code_id}`, SN: `{c['serial_number']}`).")
+        else:
+            send_message(chat_id, "❌ Usage: `/delete_code ID` (e.g. `/delete_code 15`)")
         return
 
     if text.startswith("/help"):
@@ -909,6 +1015,92 @@ def set_webhook():
 
     r = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=10)
     return jsonify(r.json())
+
+
+@app.route("/paystack-webhook", methods=["POST"])
+def paystack_webhook():
+    import hmac
+    import hashlib
+
+    # ── Verify signature ───────────────────────────────────────────────────
+    paystack_signature = request.headers.get("x-paystack-signature")
+    if not paystack_signature:
+        return jsonify({"status": "unauthorized"}), 401
+
+    computed_signature = hmac.new(
+        bytes(PAYSTACK_SECRET, 'utf-8'),
+        msg=request.data,
+        digestmod=hashlib.sha512
+    ).hexdigest()
+
+    if paystack_signature != computed_signature:
+        return jsonify({"status": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"status": "ignored"}), 400
+
+    event = payload.get("event")
+    if event == "charge.success":
+        data = payload.get("data", {})
+        ref = data.get("reference")
+
+        if ref:
+            # Check transaction in database
+            existing = db_exec(
+                "SELECT status, exam_type, quantity, user_id FROM transactions WHERE transaction_ref = %s",
+                (ref,),
+                fetch="one",
+            )
+            if existing and existing["status"] == "Pending":
+                user_id   = existing["user_id"]
+                exam_type = existing["exam_type"]
+                quantity  = existing["quantity"]
+                amount    = data.get("amount", 0) / 100
+
+                # Claim codes
+                codes = db_exec(
+                    """
+                    SELECT id, pin, serial_number FROM checker_codes
+                    WHERE exam_type = %s AND is_used = FALSE
+                    LIMIT %s
+                    """,
+                    (exam_type, quantity),
+                    fetch="all",
+                )
+                if codes and len(codes) >= quantity:
+                    code_ids = [c["id"] for c in codes]
+                    db_exec("UPDATE checker_codes SET is_used = TRUE WHERE id = ANY(%s::int[])", (code_ids,))
+                    db_exec("UPDATE transactions SET status = 'Completed' WHERE transaction_ref = %s", (ref,))
+                    db_exec(
+                        "INSERT INTO sales (user_id, exam_type, quantity, amount) VALUES (%s, %s, %s, %s)",
+                        (user_id, exam_type, quantity, amount),
+                    )
+
+                    send_message(user_id, f"✅ *Payment confirmed!* Here are your *{exam_type}* checker codes:")
+                    for i, code in enumerate(codes, 1):
+                        send_message(
+                            user_id,
+                            f"🔑 *Code #{i}:*\nSerial Number: `{code['serial_number']}`\nPin: `{code['pin']}`",
+                        )
+                    send_message(user_id, "🌐 Visit *ghana.waecdirect.org* to check your results.")
+
+                    # Notify admins of a sale!
+                    for admin_id in ADMINS:
+                        try:
+                            send_message(admin_id, f"💰 *New Sale!* User `{user_id}` bought {quantity} × {exam_type} for GH₵{amount:.2f}")
+                        except Exception:
+                            pass
+                else:
+                    send_message(user_id, f"✅ Payment of GH₵{amount:.2f} received, but we ran out of {exam_type} codes! Please contact support.")
+                    # Notify admins
+                    for admin_id in ADMINS:
+                        try:
+                            send_message(admin_id, f"⚠️ *OUT OF STOCK ALERT* — User `{user_id}` paid for {quantity} × {exam_type} but no codes were available!")
+                        except Exception:
+                            pass
+
+    return jsonify({"status": "success"})
 
 
 @app.route("/get-webhook-info", methods=["GET"])
